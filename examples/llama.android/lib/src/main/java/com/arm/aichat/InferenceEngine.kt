@@ -14,6 +14,19 @@ interface InferenceEngine {
     val state: StateFlow<State>
 
     /**
+     * Tokens currently held in the context, system prompt and whole conversation included.
+     *
+     * Drops when the context gets full and the older half of the conversation is discarded.
+     * Read without synchronization, so it can lag by one token while generating.
+     */
+    val contextUsed: Int
+
+    /**
+     * Context capacity in tokens, 0 when no model is loaded
+     */
+    val contextTotal: Int
+
+    /**
      * Load a model from the given path.
      *
      * @throws UnsupportedArchitectureException if model architecture not supported

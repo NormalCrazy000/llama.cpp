@@ -18,14 +18,21 @@ import com.arm.aichat.InferenceEngine
 import com.arm.aichat.gguf.GgufMetadata
 import com.arm.aichat.gguf.GgufMetadataReader
 import com.google.android.material.floatingactionbutton.FloatingActionButton
+import com.google.android.material.materialswitch.MaterialSwitch
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
+import java.net.Inet4Address
+import java.net.NetworkInterface
 import java.util.UUID
 
 class MainActivity : AppCompatActivity() {
@@ -35,16 +42,29 @@ class MainActivity : AppCompatActivity() {
     private lateinit var messagesRv: RecyclerView
     private lateinit var userInputEt: EditText
     private lateinit var userActionFab: FloatingActionButton
+    private lateinit var httpStatusTv: TextView
+    private lateinit var httpSwitch: MaterialSwitch
+    private lateinit var contextStatusTv: TextView
+
+    private val prefs by lazy { getSharedPreferences(PREFS_NAME, MODE_PRIVATE) }
 
     // Arm AI Chat inference engine
     private lateinit var engine: InferenceEngine
     private var generationJob: Job? = null
 
     // Conversation states
+    @Volatile
     private var isModelReady = false
     private val messages = mutableListOf<Message>()
     private val lastAssistantMsg = StringBuilder()
     private val messageAdapter = MessageAdapter(messages)
+    private val chatMutex = Mutex()
+
+    // Local HTTP endpoint driving the chat, started once the model is ready
+    private val httpServer = ChatHttpServer(HTTP_PORT) { message ->
+        check(isModelReady) { "Model not ready" }
+        runBlocking { lifecycleScope.async(Dispatchers.Default) { sendMessage(message) }.await() }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -60,6 +80,15 @@ class MainActivity : AppCompatActivity() {
         messagesRv.adapter = messageAdapter
         userInputEt = findViewById(R.id.user_input)
         userActionFab = findViewById(R.id.fab)
+
+        contextStatusTv = findViewById(R.id.context_status)
+
+        // The endpoint stays off until the user opts in, and is only usable once a model is loaded
+        httpStatusTv = findViewById(R.id.http_status)
+        httpSwitch = findViewById(R.id.http_switch)
+        httpSwitch.isChecked = prefs.getBoolean(PREF_HTTP_ENABLED, false)
+        // Click, not checked-change, so that reverting the switch on error does not loop back here
+        httpSwitch.setOnClickListener { setHttpServerEnabled(httpSwitch.isChecked) }
 
         // Arm AI Chat initialization
         lifecycleScope.launch(Dispatchers.Default) {
@@ -119,6 +148,11 @@ class MainActivity : AppCompatActivity() {
                         userInputEt.isEnabled = true
                         userActionFab.setImageResource(R.drawable.outline_send_24)
                         userActionFab.isEnabled = true
+
+                        httpSwitch.isEnabled = true
+                        if (httpSwitch.isChecked) setHttpServerEnabled(true)
+
+                        updateContextStatus()
                     }
                 }
             }
@@ -159,6 +193,61 @@ class MainActivity : AppCompatActivity() {
         }
 
     /**
+     * Show how much of the context the conversation takes up.
+     *
+     * The counter drops when the context gets full, because the older half is discarded.
+     */
+    private fun updateContextStatus() {
+        val used = engine.contextUsed
+        val total = engine.contextTotal
+        contextStatusTv.text = if (total == 0) {
+            "Context: no model loaded"
+        } else {
+            "Context: $used / $total tokens (${used * 100 / total}%)"
+        }
+    }
+
+    /**
+     * Open or close the local HTTP endpoint, and remember the choice for the next launch.
+     *
+     * The port is only bound while enabled, so disabling it closes the port entirely.
+     */
+    private fun setHttpServerEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(PREF_HTTP_ENABLED, enabled).apply()
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            var failed = false
+            val status = try {
+                if (enabled) {
+                    httpServer.start()
+                    "Endpoint: http://${localIpAddress()}:$HTTP_PORT/chat"
+                } else {
+                    httpServer.stop()
+                    "HTTP endpoint disabled"
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to ${if (enabled) "start" else "stop"} HTTP server", e)
+                failed = true
+                "Endpoint error: ${e.message}"
+            }
+
+            withContext(Dispatchers.Main) {
+                httpStatusTv.text = status
+                if (failed) httpSwitch.isChecked = false
+            }
+        }
+    }
+
+    /**
+     * First non-loopback IPv4 address, to show where the endpoint can be reached
+     */
+    private fun localIpAddress() = NetworkInterface.getNetworkInterfaces().asSequence()
+        .filter { it.isUp && !it.isLoopback }
+        .flatMap { it.inetAddresses.asSequence() }
+        .filterIsInstance<Inet4Address>()
+        .firstOrNull()?.hostAddress ?: "127.0.0.1"
+
+    /**
      * Validate and send the user message into [InferenceEngine]
      */
     private fun handleUserInput() {
@@ -167,36 +256,51 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this, "Input message is empty!", Toast.LENGTH_SHORT).show()
             } else {
                 userInputEt.text = null
-                userInputEt.isEnabled = false
-                userActionFab.isEnabled = false
-
-                // Update message states
-                messages.add(Message(UUID.randomUUID().toString(), userMsg, true))
-                lastAssistantMsg.clear()
-                messages.add(Message(UUID.randomUUID().toString(), lastAssistantMsg.toString(), false))
-
-                generationJob = lifecycleScope.launch(Dispatchers.Default) {
-                    engine.sendUserPrompt(userMsg)
-                        .onCompletion {
-                            withContext(Dispatchers.Main) {
-                                userInputEt.isEnabled = true
-                                userActionFab.isEnabled = true
-                            }
-                        }.collect { token ->
-                            withContext(Dispatchers.Main) {
-                                val messageCount = messages.size
-                                check(messageCount > 0 && !messages[messageCount - 1].isUser)
-
-                                messages.removeAt(messageCount - 1).copy(
-                                    content = lastAssistantMsg.append(token).toString()
-                                ).let { messages.add(it) }
-
-                                messageAdapter.notifyItemChanged(messages.size - 1)
-                            }
-                        }
-                }
+                generationJob = lifecycleScope.launch(Dispatchers.Default) { sendMessage(userMsg) }
             }
         }
+    }
+
+    /**
+     * Write the message into the chat and collect the assistant answer.
+     *
+     * Shared by the send button and by [ChatHttpServer], hence serialized with [chatMutex] because [InferenceEngine] handles one prompt at a time.
+     *
+     * @return the complete assistant answer
+     */
+    private suspend fun sendMessage(userMsg: String): String = chatMutex.withLock {
+        withContext(Dispatchers.Main) {
+            userInputEt.isEnabled = false
+            userActionFab.isEnabled = false
+
+            // Update message states
+            messages.add(Message(UUID.randomUUID().toString(), userMsg, true))
+            lastAssistantMsg.clear()
+            messages.add(Message(UUID.randomUUID().toString(), lastAssistantMsg.toString(), false))
+        }
+
+        engine.sendUserPrompt(userMsg)
+            .onCompletion {
+                withContext(Dispatchers.Main) {
+                    userInputEt.isEnabled = true
+                    userActionFab.isEnabled = true
+                    updateContextStatus()
+                }
+            }.collect { token ->
+                withContext(Dispatchers.Main) {
+                    val messageCount = messages.size
+                    check(messageCount > 0 && !messages[messageCount - 1].isUser)
+
+                    messages.removeAt(messageCount - 1).copy(
+                        content = lastAssistantMsg.append(token).toString()
+                    ).let { messages.add(it) }
+
+                    messageAdapter.notifyItemChanged(messages.size - 1)
+                    updateContextStatus()
+                }
+            }
+
+        lastAssistantMsg.toString()
     }
 
     /**
@@ -237,6 +341,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        httpServer.stop()
         engine.destroy()
         super.onDestroy()
     }
@@ -246,6 +351,10 @@ class MainActivity : AppCompatActivity() {
 
         private const val DIRECTORY_MODELS = "models"
         private const val FILE_EXTENSION_GGUF = ".gguf"
+
+        private const val HTTP_PORT = 8080
+        private const val PREFS_NAME = "settings"
+        private const val PREF_HTTP_ENABLED = "http_enabled"
 
         private const val BENCH_PROMPT_PROCESSING_TOKENS = 512
         private const val BENCH_TOKEN_GENERATION_TOKENS = 128

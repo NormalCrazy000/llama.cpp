@@ -5,6 +5,7 @@ import android.util.Log
 import com.arm.aichat.InferenceEngine
 import com.arm.aichat.UnsupportedArchitectureException
 import com.arm.aichat.internal.InferenceEngineImpl.Companion.getInstance
+import com.arm.aichat.isModelLoaded
 import dalvik.annotation.optimization.FastNative
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -104,6 +105,12 @@ internal class InferenceEngineImpl private constructor(
     private external fun generateNextToken(): String?
 
     @FastNative
+    private external fun contextPosition(): Int
+
+    @FastNative
+    private external fun contextSize(): Int
+
+    @FastNative
     private external fun unload()
 
     @FastNative
@@ -116,6 +123,15 @@ internal class InferenceEngineImpl private constructor(
     private var _readyForSystemPrompt = false
     @Volatile
     private var _cancelGeneration = false
+
+    /**
+     * Read off the llama dispatcher on purpose, so the counter stays live while generating
+     */
+    override val contextUsed: Int
+        get() = if (_state.value.isModelLoaded) contextPosition() else 0
+
+    override val contextTotal: Int
+        get() = if (_state.value.isModelLoaded) contextSize() else 0
 
     /**
      * Single-threaded coroutine dispatcher & scope for LLama asynchronous operations

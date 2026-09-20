@@ -449,6 +449,23 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(
     return 0;
 }
 
+/**
+ * Tokens currently held in the context, and the context capacity.
+ *
+ * Both are plain reads, so a value sampled during generation can lag by one token.
+ */
+extern "C"
+JNIEXPORT jint JNICALL
+Java_com_arm_aichat_internal_InferenceEngineImpl_contextPosition(JNIEnv * /*unused*/, jobject /*unused*/) {
+    return current_position;
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_com_arm_aichat_internal_InferenceEngineImpl_contextSize(JNIEnv * /*unused*/, jobject /*unused*/) {
+    return g_context ? (jint) llama_n_ctx(g_context) : 0;
+}
+
 static bool is_valid_utf8(const char *string) {
     if (!string) { return true; }
 
@@ -556,6 +573,11 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_unload(JNIEnv * /*unused*/, job
     llama_batch_free(g_batch);
     llama_free(g_context);
     llama_model_free(g_model);
+
+    // Clear the freed pointers, they are still readable from the JNI getters
+    g_sampler = nullptr;
+    g_context = nullptr;
+    g_model = nullptr;
 }
 
 extern "C"
